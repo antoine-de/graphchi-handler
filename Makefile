@@ -8,7 +8,7 @@ HEADERS=$(shell find . -name '*.hpp')
 
 all:
 	@mkdir -p bin/
-	$(CPP) $(CPPFLAGS) src/main.cpp -o bin/graphchi_handler $(LINKERFLAGS) 
+	$(CPP) $(CPPFLAGS) src/main.cpp src/deps/MurmurHash3.cc -o bin/graphchi_handler $(LINKERFLAGS) 
 
 	
 
