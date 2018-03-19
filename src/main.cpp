@@ -10,9 +10,6 @@
 #define RANDOMRESETPROB 0.15
 
 
-typedef float VertexDataType;
-typedef float EdgeDataType;
-
 using graphchi::GraphChiProgram;
 using graphchi::graphchi_context;
 using graphchi::graphchi_vertex;
@@ -23,8 +20,11 @@ using graphchi::graphchi_engine;
 using graphchi::vertex_value;
 using graphchi::vid_t;
 
+typedef float EdgeDataType;
+
 struct PagerankProgram : public GraphChiProgram<VertexDataType, EdgeDataType> {
-    
+    VerticesData& vertices_data;
+    PagerankProgram(VerticesData& d): vertices_data(d) {}
     /**
       * Called before an iteration starts. Not implemented.
       */
@@ -48,47 +48,79 @@ struct PagerankProgram : public GraphChiProgram<VertexDataType, EdgeDataType> {
       * Pagerank update function.
       */
     void update(graphchi_vertex<VertexDataType, EdgeDataType> &v, graphchi_context &ginfo) {
-        float sum=0;
         if (ginfo.iteration == 0) {
             /* On first iteration, initialize vertex and out-edges. 
                The initialization is important,
                because on every run, GraphChi will modify the data in the edges on disk. 
              */
-            for(int i=0; i < v.num_outedges(); i++) {
-                graphchi_edge<float> * edge = v.outedge(i);
-                edge->set_data(1.0 / v.num_outedges());
+            if (v.outc > 0) {
+                vertices_data[v.id()].page_rank = 1.0f / v.outc;
             }
-            v.set_data(RANDOMRESETPROB); 
         } else {
-            /* Compute the sum of neighbors' weighted pageranks by
-               reading from the in-edges. */
-            for(int i=0; i < v.num_inedges(); i++) {
-                float val = v.inedge(i)->get_data();
-                sum += val;                    
+            float sum_page_rank = 0;
+            float sum_porn_rank = 0;
+            float sum_trust_rank = 0;
+            for (int i = 0; i < v.num_inedges(); i++) {
+                const auto& in_vertice_data = vertices_data[v.inedge(i)->vertexid];
+                sum_page_rank += in_vertice_data.page_rank;
+                sum_porn_rank += in_vertice_data.porn_rank;
+                sum_trust_rank += in_vertice_data.trust_rank;
             }
+
+            const auto& vertice_data = vertices_data[v.id()];
+            float page_rank;
+            if (v.outc > 0) {
+                page_rank = (RANDOMRESETPROB + (1 - RANDOMRESETPROB) * sum_page_rank) / v.outc;
+            } else {
+                page_rank = (RANDOMRESETPROB + (1 - RANDOMRESETPROB) * sum_page_rank);
+            }
+
+            float porn_rank = vertice_data.porn_rank + sum_porn_rank / 10; // dumb value for the moment
+            float trust_rank = vertice_data.trust_rank + sum_trust_rank / 10; // dumb value for the moment
             
-            /* Compute my pagerank */
-            float pagerank = RANDOMRESETPROB + (1 - RANDOMRESETPROB) * sum;
-            
-            /* Write my pagerank divided by the number of out-edges to
-               each of my out-edges. */
-            if (v.num_outedges() > 0) {
-                float pagerankcont = pagerank / v.num_outedges();
-                for(int i=0; i < v.num_outedges(); i++) {
-                    graphchi_edge<float> * edge = v.outedge(i);
-                    edge->set_data(pagerankcont);
+            vertices_data[v.id()] = VertexDataType {
+                page_rank,
+                trust_rank,
+                porn_rank,
+                //spam_rank
+            };
+
+            if (ginfo.iteration == ginfo.num_iterations - 1) { // NOTE: I think we can skip this part and use directly vertices_data as output
+                /* On last iteration, multiply pr by degree and store the result */
+                auto& v_data = vertices_data[v.id()];
+                if (v.outc) {
+                    v_data.page_rank *= v.outc;
                 }
+                v.set_data(v_data); 
             }
-                
-            /* Keep track of the progression of the computation.
-               GraphChi engine writes a file filename.deltalog. */
-            ginfo.log_change(std::abs(pagerank - v.get_data()));
-            
-            /* Set my new pagerank as the vertex value */
-            v.set_data(pagerank); 
         }
     }
 };
+
+void publish_results(const Context& ctx, const std::string& filename, graphchi::metrics& m) {
+    graphchi::stripedio iomgr(m);
+    vid_t readwindow = 1024 * 1024;
+    size_t numvertices = graphchi::get_num_vertices(filename);
+    auto vertexdata = graphchi::vertex_data_store<VertexDataType>{filename, numvertices, &iomgr};
+
+    /* Iterate the vertex values and maintain the top-list */
+    size_t idx = 0;
+    vid_t st = 0;
+    vid_t en = numvertices - 1;
+
+    size_t count = 0;
+    for (vid_t it_vertices = 0; it_vertices < numvertices; it_vertices += readwindow) {
+        vid_t end = std::min(it_vertices + readwindow, numvertices);
+
+        vertexdata.load(it_vertices, end - 1);
+        for (vid_t v = it_vertices; v < end; v++) {
+            const VertexDataType& val = *vertexdata.vertex_data_ptr(v);
+            const auto& uuid = ctx.vertices_uuid[v];
+
+            std::cout << " for graphchi id " << v << " uuid " << uuid << " value = " << val << std::endl;
+        }
+    }
+}
 
 int main(int argc, const char ** argv) {
     graphchi::graphchi_init(argc, argv);
@@ -101,23 +133,19 @@ int main(int argc, const char ** argv) {
     int ntop                = get_option_int("top", 20);
     
     /* Process input file - if not already preprocessed */
-    int nshards             = fetch_data(get_option_string("nshards", "auto"),
+    Context ctx;
+    int nshards             = fetch_data(ctx, get_option_string("nshards", "auto"),
                                                 get_option_string("worker_db"),
                                                 get_option_string("link_db"));
 
     /* Run */
-    graphchi::graphchi_engine<float, float> engine(FILE_NAME, nshards, scheduler, m); 
+    graphchi::graphchi_engine<VertexDataType, EdgeDataType> engine(FILE_NAME, nshards, scheduler, m); 
     engine.set_modifies_inedges(false); // Improves I/O performance.
    
-    PagerankProgram program;
+    PagerankProgram program(ctx.vertices_data);
     engine.run(program, niters);
     
-    /* Output top ranked vertices */
-    std::vector< vertex_value<float> > top = graphchi::get_top_vertices<float>(FILE_NAME, ntop);
-    std::cout << "Print top " << ntop << " vertices:" << std::endl;
-    for(int i=0; i < (int)top.size(); i++) {
-        std::cout << (i+1) << ". " << top[i].vertex << "\t" << top[i].value << std::endl;
-    }
+    publish_results(ctx, FILE_NAME, m);
     
     metrics_report(m);    
     return 0;

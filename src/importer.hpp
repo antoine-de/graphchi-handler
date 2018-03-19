@@ -20,127 +20,152 @@ namespace std {
         return stream;
     }
 }
+
 uuid_t mm3(const std::string& val) {
     uuid_t hash;
     const auto default_seed = 1717;
     MurmurHash3_x64_128(val.c_str(), val.size(), default_seed, &hash);
     return hash;
 }
-    struct VerticeInitData {
-        float trust_rank;
-        float porn_rank;
-        float spam_rank;
-    };
 
-    struct Compare {
-        bool operator () (const uuid_t& a, const uuid_t& b) const { return a < b; }
-        static uuid_t max_value() { return {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()}; }
-    };
+struct VertexDataType {
+    float page_rank;
+    float trust_rank;
+    float porn_rank;
+    // float spam_rank;
+};
 
-    using VerticesIdMap = stxxl::map<uuid_t, uint64_t, Compare, DATA_NODE_BLOCK_SIZE, DATA_LEAF_BLOCK_SIZE>;
-    using VerticesData = stxxl::VECTOR_GENERATOR<VerticeInitData>::result;
-    using EdgeDataType = float; // for the moment it's a float, but it might become a more complex POD
+std::ostream& operator<<(std::ostream& stream, const VertexDataType& val) {
+    stream << "pr: " << val.page_rank 
+    << ", trust: " << val.trust_rank 
+    << ", porn: " << val.porn_rank;
+    return stream;
+}
 
-    uuid_t read_id(const pqxx::tuple& row) {
-        // return {row["hashl"].as<uint64_t>(), row["hashr"].as<uint64_t>()};
-        // for the moment there is no uri in the db, so we compute the hash again, but it's temporary
-        const std::string url = row["url"].as<std::string>();
-        return mm3(url);
+struct Compare {
+    bool operator () (const uuid_t& a, const uuid_t& b) const { return a < b; }
+    static uuid_t max_value() { return {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()}; }
+};
+
+using VerticesIdMap = stxxl::map<uuid_t, uint64_t, Compare, DATA_NODE_BLOCK_SIZE, DATA_LEAF_BLOCK_SIZE>;
+using VerticesData = stxxl::VECTOR_GENERATOR<VertexDataType>::result;
+using VerticesUuid = stxxl::VECTOR_GENERATOR<uuid_t>::result;
+using EdgeDataType = float; // for the moment it's a float, but it might become a more complex POD
+
+struct Context {
+    Context(const uint64_t map_node_cache_size = VerticesIdMap::node_block_type::raw_size * 10, 
+            const uint64_t map_leaf_cache_size = VerticesIdMap::leaf_block_type::raw_size * 10): 
+            id_map(map_node_cache_size, map_leaf_cache_size) {}
+
+    VerticesIdMap id_map; // used to associate an uuid to an internal graphchi ID
+    VerticesData vertices_data{}; // used to initialize the graph
+    VerticesUuid vertices_uuid{}; // used to find the original uuid at the end of the run
+};
+
+uuid_t read_id(const pqxx::tuple& row) {
+    // for the moment there is no uri in the db, so we compute the hash again, but it's temporary, we should always use the central ID
+    
+    // return {row["hashl"].as<uint64_t>(), row["hashr"].as<uint64_t>()};
+    const std::string url = row["url"].as<std::string>();
+    return mm3(url);
+}
+
+uint64_t fetch_vertices(Context& ctx, const std::string& worker_db_cnx) {
+    pqxx::connection c(worker_db_cnx);
+    pqxx::work transaction(c);
+
+    auto results = transaction.exec("SELECT * FROM scores");
+    uint64_t num_vertices = 0;
+    for (const auto& row: results) {
+        const uuid_t id = read_id(row);
+        ctx.id_map[id] = num_vertices;
+        ctx.vertices_uuid.push_back(id);
+
+        const auto get_nullable = [](const pqxx::result::field& val) -> float {
+            if (val.is_null()) {
+                return {};
+            }
+            return val.as<float>();
+        };
+
+        ctx.vertices_data.push_back(VertexDataType{
+            0,
+            get_nullable(row["trustrank"]),
+            get_nullable(row["pornrank"]),
+            // get_nullable(row["spamrank"])
+        });
+        std::cout << " for url " << row["url"].as<std::string>().substr(6, 20) << " id " << id << " idx = " << num_vertices << " pron = " 
+        << ctx.vertices_data.back().porn_rank << std::endl;
+        num_vertices++;
     }
+    return num_vertices;
+}
 
-    uint64_t fetch_vertices(const std::string& worker_db_cnx, VerticesIdMap& id_map, VerticesData& vertices_data) {
-        pqxx::connection c(worker_db_cnx);
-        pqxx::work transaction(c);
-
-        auto results = transaction.exec("SELECT * FROM scores");
-        uint64_t num_vertices = 0;
-        for (const auto& row: results) {
-            const uuid_t id = read_id(row);
-            id_map[id] = num_vertices++;
-
-            auto get_nullable = [](const pqxx::result::field& val) -> float {
-                if (val.is_null()) {
-                    return {};
-                }
-                return val.as<float>();
-            };
-
-            vertices_data.push_back(VerticeInitData{
-                get_nullable(row["trustrank"]),
-                get_nullable(row["pornrank"]),
-                get_nullable(row["spamrank"])
-            });
-            std::cout << " for id " << id << " idx = " << num_vertices - 1 << std::endl;
-        }
-        return num_vertices;
+void add_edge(const VerticesIdMap& id_map, graphchi::sharder<EdgeDataType>& sharder, const uuid_t& from, const uuid_t& to) {
+    auto from_it = id_map.find(from);
+    if (from_it == id_map.end()) {
+        std::cerr << "impossible to find " << from << " source node, skipping edge" << std::endl;
+        return;
     }
-
-    void add_edge(const VerticesIdMap& id_map, graphchi::sharder<EdgeDataType>& sharder, const uuid_t& from, const uuid_t& to) {
-        auto from_it = id_map.find(from);
-        if (from_it == id_map.end()) {
-            return;
-        }
-        const uint64_t from_idx = from_it->second;
-        auto to_it = id_map.find(to);
-        if (to_it == id_map.end()) {
-            return;
-        }
-        const uint64_t to_idx = to_it->second;
-        sharder.preprocessing_add_edge(from_idx, to_idx);
+    const uint64_t from_idx = from_it->second;
+    auto to_it = id_map.find(to);
+    if (to_it == id_map.end()) {
+        std::cerr << "impossible to find " << to << " target node, skipping edge" << std::endl;
+        return;
     }
+    const uint64_t to_idx = to_it->second;
+    std::cout <<" add edge " << from_idx << " -> " << to_idx <<  std::endl;
+    sharder.preprocessing_add_edge(from_idx, to_idx);
+}
 
-    void fetch_edges(const VerticesIdMap& id_map, const std::string& link_db_cnx, graphchi::sharder<EdgeDataType>& sharder) {
+void fetch_edges(const VerticesIdMap& id_map, const std::string& link_db_cnx, graphchi::sharder<EdgeDataType>& sharder) {
 
-        // for the moment we read a dump edge file
-        std::ifstream file{link_db_cnx, std::fstream::in};
-        std::string line;
-        while(std::getline(file, line)) {
-            std::stringstream lineStream(line);
-            std::string from_url, to_url;
-            assert(std::getline(lineStream, from_url, ','));
-            assert(std::getline(lineStream, to_url, ','));
-            std::cout << from_url << "->" << to_url << std::endl;
+    // for the moment we read a dump edge file
+    std::ifstream file{link_db_cnx, std::fstream::in};
+    std::string line;
+    while(std::getline(file, line)) {
+        std::stringstream lineStream(line);
+        std::string from_url, to_url;
+        assert(std::getline(lineStream, from_url, ','));
+        assert(std::getline(lineStream, to_url, ','));
 
-            const uuid_t from = mm3(from_url);
-            const uuid_t to = mm3(to_url);
+        const uuid_t from = mm3(from_url);
+        const uuid_t to = mm3(to_url);
+        std::cout << from_url << " (" << from << ") -> " << to_url << " (" << to << ")" << std::endl;
 
-            add_edge(id_map, sharder, from, to);
-        }
+        add_edge(id_map, sharder, from, to);
     }
+}
 
-    int fetch_edges_and_shard(const VerticesIdMap& id_map, 
-    const std::string& link_db_cnx, 
-    const uint64_t num_vertices, 
-    const std::string& nshards_string) {
-        graphchi::sharder<EdgeDataType> sharder(FILE_NAME);
-        sharder.start_preprocessing();
+int fetch_edges_and_shard(const VerticesIdMap& id_map, 
+                            const std::string& link_db_cnx, 
+                            const uint64_t num_vertices, 
+                            const std::string& nshards_string) {
+    graphchi::sharder<EdgeDataType> sharder(FILE_NAME);
+    sharder.start_preprocessing();
 
-        fetch_edges(id_map, link_db_cnx, sharder);
+    fetch_edges(id_map, link_db_cnx, sharder);
 
-        sharder.end_preprocessing();
+    sharder.end_preprocessing();
 
-        sharder.set_max_vertex_id(num_vertices);
-        
-        int nshards = sharder.execute_sharding(nshards_string);
-        logstream(LOG_INFO) << "Successfully finished sharding " << std::endl;
-        logstream(LOG_INFO) << "Created " << nshards << " shards." << std::endl;
-        return nshards;
-    }
+    sharder.set_max_vertex_id(num_vertices);
+    
+    int nshards = sharder.execute_sharding(nshards_string);
+    logstream(LOG_INFO) << "Successfully finished sharding " << std::endl;
+    logstream(LOG_INFO) << "Created " << nshards << " shards." << std::endl;
+    return nshards;
+}
 
-    int fetch_data(const std::string& nshards_string, 
-                    const std::string& worker_db_cnx, 
-                    const std::string& link_db_cnx) {
-        // for the moment we always create new shards
-        logstream(LOG_INFO) << "create sharding now..." << std::endl;
+int fetch_data(Context& ctx, const std::string& nshards_string, 
+                const std::string& worker_db_cnx, 
+                const std::string& link_db_cnx) {
+    // for the moment we always create new shards
+    logstream(LOG_INFO) << "create sharding now..." << std::endl;
 
-        // we get all the vertices (websites) from the database
-        const auto node_cache_size = VerticesIdMap::node_block_type::raw_size * 10;
-        const auto leaf_cache_size = VerticesIdMap::leaf_block_type::raw_size * 10;
-        VerticesIdMap id_map(node_cache_size, leaf_cache_size);
-        VerticesData vertices_data{}; // TODO compute vertices size before
-        const auto num_vertices = fetch_vertices(worker_db_cnx, id_map, vertices_data);
+    // we get all the vertices (websites) from the database
+    const auto num_vertices = fetch_vertices(ctx, worker_db_cnx);
 
-        // we get all the edges from the link database and use the id_map to set their id
-        const int nshards = fetch_edges_and_shard(id_map, link_db_cnx, num_vertices, nshards_string);
-        return nshards;
-    }
+    // we get all the edges from the link database and use the id_map to set their id
+    const int nshards = fetch_edges_and_shard(ctx.id_map, link_db_cnx, num_vertices, nshards_string);
+    return nshards;
+}
