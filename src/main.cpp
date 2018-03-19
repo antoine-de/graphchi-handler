@@ -5,6 +5,7 @@
 #include "graphchi_basic_includes.hpp"
 #include "util/toplist.hpp"
 #include "importer.hpp"
+#include "objects.hpp"
 
 #define THRESHOLD 1e-1    
 #define RANDOMRESETPROB 0.15
@@ -19,8 +20,6 @@ using graphchi::get_option_int;
 using graphchi::graphchi_engine;
 using graphchi::vertex_value;
 using graphchi::vid_t;
-
-typedef float EdgeDataType;
 
 struct PagerankProgram : public GraphChiProgram<VertexDataType, EdgeDataType> {
     VerticesData& vertices_data;
